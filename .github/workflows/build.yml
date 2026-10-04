@@ -39,13 +39,16 @@ jobs:
           for G in TMessagesProj/build.gradle TMessagesProj_App/build.gradle; do
             sed -i -E '/applicationIdSuffix/d' "$G"
             sed -i -E 's/(applicationId[ =]+)("[^"]*"|[A-Za-z_.]+)/\1"com.parthi.loudtg"/' "$G"
-            sed -i -E "/applicationId/ s/org\.telegram\.messenger(\.[A-Za-z_]+)*/com.parthi.loudtg/" "$G"
           done
-          sed -i -E 's/org\.telegram\.messenger(\.[A-Za-z_]+)*/com.parthi.loudtg/' gradle.properties
-          echo "---- package name lines after edit ----"
+          sed -i -E 's/^APP_PACKAGE[ ]*=.*/APP_PACKAGE=com.parthi.loudtg/' gradle.properties
+          echo "---- package name lines ----"
           grep -rn "org.telegram.messenger\|loudtg" --include=build.gradle --include=gradle.properties . || true
           for d in . TMessagesProj TMessagesProj_App; do
             printf '%s' "$GOOGLE_SERVICES_JSON" > "$d/google-services.json"
+            for N in org.telegram.messenger org.telegram.messenger.beta org.telegram.messenger.web; do
+              jq --arg n "$N" '.client += [ .client[0] | .client_info.android_client_info.package_name = $n ]' "$d/google-services.json" > "$d/gs.tmp"
+              mv "$d/gs.tmp" "$d/google-services.json"
+            done
           done
 
       - name: Quick check
