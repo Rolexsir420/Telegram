@@ -179,6 +179,14 @@ public class WebRtcAudioRecord {
             byteBuffer.clear();
             byteBuffer.put(emptyBytes);
           }
+          if (!microphoneMute) {
+  final float gain = 10.0f;
+  for (int g = 0; g < bytesRead / 2; g++) {
+    float s = byteBuffer.getShort(g * 2) / 32768f;
+    s = (float) Math.tanh(s * gain);
+    byteBuffer.putShort(g * 2, (short) (s * 32767f));
+  }
+}
           if (bytesRead == deviceBytesRead) {
             deviceByteBuffer.position(0);
             byteBuffer.position(0);
