@@ -39,17 +39,22 @@ jobs:
           for G in TMessagesProj/build.gradle TMessagesProj_App/build.gradle; do
             sed -i -E '/applicationIdSuffix/d' "$G"
             sed -i -E 's/(applicationId[ =]+)("[^"]*"|[A-Za-z_.]+)/\1"com.parthi.loudtg"/' "$G"
+            sed -i -E "/applicationId/ s/org\.telegram\.messenger(\.[A-Za-z_]+)*/com.parthi.loudtg/" "$G"
           done
-          sed -i -E 's/^APP_PACKAGE[ ]*=.*/APP_PACKAGE=com.parthi.loudtg/' gradle.properties
-          grep -n "APP_PACKAGE\|applicationId" gradle.properties TMessagesProj/build.gradle TMessagesProj_App/build.gradle || true
+          sed -i -E 's/org\.telegram\.messenger(\.[A-Za-z_]+)*/com.parthi.loudtg/' gradle.properties
+          echo "---- package name lines after edit ----"
+          grep -rn "org.telegram.messenger\|loudtg" --include=build.gradle --include=gradle.properties . || true
           for d in . TMessagesProj TMessagesProj_App; do
             printf '%s' "$GOOGLE_SERVICES_JSON" > "$d/google-services.json"
           done
 
-      - name: Build
+      - name: Quick check
         run: |
           chmod +x gradlew
-          ./gradlew :TMessagesProj_App:assembleDebug --no-daemon --stacktrace
+          ./gradlew :TMessagesProj:processDebugGoogleServices :TMessagesProj_App:processAfatDebugGoogleServices --no-daemon --stacktrace
+
+      - name: Build
+        run: ./gradlew :TMessagesProj_App:assembleDebug --no-daemon --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
