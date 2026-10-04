@@ -38,8 +38,9 @@ jobs:
           sed -i -E "s/(APP_HASH = \")[^\"]*(\")/\1${TG_API_HASH}\2/" "$B"
           G=TMessagesProj_App/build.gradle
           sed -i -E '/applicationIdSuffix/d' "$G"
-          sed -i -E 's/(applicationId[ =]+)"[^"]*"/\1"com.parthi.loudtg"/' "$G"
-          grep -n "applicationId" "$G" || true
+          sed -i -E 's/(applicationId[ =]+)("[^"]*"|[A-Za-z_.]+)/\1"com.parthi.loudtg"/' "$G"
+          sed -i -E 's/^APP_PACKAGE[ ]*=.*/APP_PACKAGE=com.parthi.loudtg/' gradle.properties
+          grep -n "APP_PACKAGE\|applicationId" gradle.properties "$G" || true
           for d in . TMessagesProj TMessagesProj_App; do
             printf '%s' "$GOOGLE_SERVICES_JSON" > "$d/google-services.json"
           done
