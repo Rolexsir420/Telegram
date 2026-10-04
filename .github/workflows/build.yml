@@ -36,11 +36,12 @@ jobs:
           B=TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
           sed -i -E "s/(APP_ID = )[0-9]+/\1${TG_API_ID}/" "$B"
           sed -i -E "s/(APP_HASH = \")[^\"]*(\")/\1${TG_API_HASH}\2/" "$B"
-          G=TMessagesProj_App/build.gradle
-          sed -i -E '/applicationIdSuffix/d' "$G"
-          sed -i -E 's/(applicationId[ =]+)("[^"]*"|[A-Za-z_.]+)/\1"com.parthi.loudtg"/' "$G"
+          for G in TMessagesProj/build.gradle TMessagesProj_App/build.gradle; do
+            sed -i -E '/applicationIdSuffix/d' "$G"
+            sed -i -E 's/(applicationId[ =]+)("[^"]*"|[A-Za-z_.]+)/\1"com.parthi.loudtg"/' "$G"
+          done
           sed -i -E 's/^APP_PACKAGE[ ]*=.*/APP_PACKAGE=com.parthi.loudtg/' gradle.properties
-          grep -n "APP_PACKAGE\|applicationId" gradle.properties "$G" || true
+          grep -n "APP_PACKAGE\|applicationId" gradle.properties TMessagesProj/build.gradle TMessagesProj_App/build.gradle || true
           for d in . TMessagesProj TMessagesProj_App; do
             printf '%s' "$GOOGLE_SERVICES_JSON" > "$d/google-services.json"
           done
