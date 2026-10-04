@@ -180,12 +180,7 @@ public class WebRtcAudioRecord {
             byteBuffer.put(emptyBytes);
           }
           if (!microphoneMute) {
-  final float gain = 10.0f;
-  for (int g = 0; g < bytesRead / 2; g++) {
-    float s = byteBuffer.getShort(g * 2) / 32768f;
-    s = (float) Math.tanh(s * gain);
-    byteBuffer.putShort(g * 2, (short) (s * 32767f));
-  }
+ LoudProcessor.process(byteBuffer, bytesRead);
 }
           if (bytesRead == deviceBytesRead) {
             deviceByteBuffer.position(0);
@@ -549,12 +544,31 @@ public class WebRtcAudioRecord {
       errorCallback.onWebRtcAudioRecordStartError(errorCode, errorMessage);
     }
   }
+  private static class LoudProcessor {
+    static final float GAIN = 40f;
+    static final float GATE = 0.01f;
+    static final float GATE_GAIN = 0.3f;
+    static final float BASS = 0.6f;
+    static float env = 0f, g = 1f, hpX = 0f, hpY = 0f, lp = 0f;
 
-  private void reportWebRtcAudioRecordError(String errorMessage) {
-    Logging.e(TAG, "Run-time recording error: " + errorMessage);
-    WebRtcAudioUtils.logAudioState(TAG);
-    if (errorCallback != null) {
-      errorCallback.onWebRtcAudioRecordError(errorMessage);
+    static void process(java.nio.ByteBuffer buf, int bytesRead) {
+      final float hpA = 0.9896f;
+      final float lpA = 0.0258f;
+      int n = bytesRead / 2;
+      for (int i = 0; i < n; i++) {
+        float x = buf.getShort(i * 2) / 32768f;
+        float y = hpA * (hpY + x - hpX);
+        hpX = x;
+        hpY = y;
+        lp += lpA * (y - lp);
+        float v = y + BASS * lp;
+        float a = Math.abs(v);
+        env += (a - env) * (a > env ? 0.05f : 0.001f);
+        float target = env < GATE ? GATE_GAIN : GAIN;
+        g += (target - g) * (target > g ? 0.02f : 0.001f);
+        float o = (float) Math.tanh(v * g);
+        buf.putShort(i * 2, (short) (o * 32767f));
+      }
     }
   }
 }
