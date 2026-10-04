@@ -1,0 +1,55 @@
+name: Build APK
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "ndk;27.2.12479018"
+
+      - name: Configure app
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          set -e
+          B=TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          sed -i -E "s/(APP_ID = )[0-9]+/\1${TG_API_ID}/" "$B"
+          sed -i -E "s/(APP_HASH = \")[^\"]*(\")/\1${TG_API_HASH}\2/" "$B"
+          G=TMessagesProj_App/build.gradle
+          sed -i -E '/applicationIdSuffix/d' "$G"
+          sed -i -E 's/(applicationId[ =]+)"[^"]*"/\1"com.parthi.loudtg"/' "$G"
+          grep -n "applicationId" "$G" || true
+          for d in . TMessagesProj TMessagesProj_App; do
+            printf '%s' "$GOOGLE_SERVICES_JSON" > "$d/google-services.json"
+          done
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew :TMessagesProj_App:assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loudtg-apk
+          path: TMessagesProj_App/build/outputs/apk/**/*.apk
