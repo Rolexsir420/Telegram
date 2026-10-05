@@ -544,6 +544,13 @@ public class WebRtcAudioRecord {
       errorCallback.onWebRtcAudioRecordStartError(errorCode, errorMessage);
     }
   }
+   private void reportWebRtcAudioRecordError(String errorMessage) {
+    Logging.e(TAG, "Run-time recording error: " + errorMessage);
+    WebRtcAudioUtils.logAudioState(TAG);
+    if (errorCallback != null) {
+      errorCallback.onWebRtcAudioRecordError(errorMessage);
+    }
+  }
   private static class LoudProcessor {
     static final float GAIN = 40f;
     static final float GATE = 0.01f;
