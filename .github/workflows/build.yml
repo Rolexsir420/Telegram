@@ -1,11 +1,18 @@
 name: Build APK
+
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PKG: com.raghavan.loudtg
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 300
     steps:
       - name: Free disk space
         run: |
@@ -26,6 +33,22 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "ndk;27.2.12479018"
 
+      - name: Check secrets
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          missing=0
+          for s in TG_API_ID TG_API_HASH GOOGLE_SERVICES_JSON KEYSTORE_BASE64 KEYSTORE_PASSWORD; do
+            if [ -z "${!s}" ]; then echo "MISSING SECRET: $s"; missing=1; else echo "found: $s"; fi
+          done
+          [ "$missing" = 0 ] || exit 1
+          echo "$GOOGLE_SERVICES_JSON" | jq -e . > /dev/null || { echo "GOOGLE_SERVICES_JSON is not valid JSON - paste the whole google-services.json file"; exit 1; }
+          if echo "$GOOGLE_SERVICES_JSON" | grep -q "\"$PKG\""; then echo "Firebase file has $PKG - push notifications OK"; else echo "::warning::Firebase file has no app for $PKG. Build will continue, but push notifications may be delayed. Add an Android app $PKG in Firebase and update the secret to fix."; fi
+
       - name: Configure app
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -38,28 +61,336 @@ jobs:
           sed -i -E "s/(APP_HASH = \")[^\"]*(\")/\1${TG_API_HASH}\2/" "$B"
           for G in TMessagesProj/build.gradle TMessagesProj_App/build.gradle; do
             sed -i -E '/applicationIdSuffix/d' "$G"
-            sed -i -E 's/(applicationId[ =]+)("[^"]*"|[A-Za-z_.]+)/\1"com.parthi.loudtg"/' "$G"
+            sed -i -E "s/(applicationId[ =]+)(\"[^\"]*\"|[A-Za-z_.]+)/\1\"$PKG\"/" "$G"
           done
-          sed -i -E 's/^APP_PACKAGE[ ]*=.*/APP_PACKAGE=com.parthi.loudtg/' gradle.properties
-          echo "---- package name lines ----"
-          grep -rn "org.telegram.messenger\|loudtg" --include=build.gradle --include=gradle.properties . || true
+          sed -i -E "s/^APP_PACKAGE[ ]*=.*/APP_PACKAGE=$PKG/" gradle.properties
+          sed -i -E 's/abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"/abiFilters "armeabi-v7a", "arm64-v8a"/' TMessagesProj_App/build.gradle
           for d in . TMessagesProj TMessagesProj_App; do
             printf '%s' "$GOOGLE_SERVICES_JSON" > "$d/google-services.json"
-            for N in org.telegram.messenger org.telegram.messenger.beta org.telegram.messenger.web; do
+            for N in "$PKG" org.telegram.messenger org.telegram.messenger.beta org.telegram.messenger.web; do
+              if jq -e --arg n "$N" '[.client[].client_info.android_client_info.package_name] | index($n)' "$d/google-services.json" > /dev/null; then continue; fi
               jq --arg n "$N" '.client += [ .client[0] | .client_info.android_client_info.package_name = $n ]' "$d/google-services.json" > "$d/gs.tmp"
               mv "$d/gs.tmp" "$d/google-services.json"
             done
           done
 
-      - name: Quick check
+      - name: Use my signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
-          chmod +x gradlew
-          ./gradlew :TMessagesProj:processDebugGoogleServices :TMessagesProj_App:processAfatDebugGoogleServices --no-daemon --stacktrace
+          set -e
+          printf '%s' "$KEYSTORE_BASE64" | tr -d ' \r\n' | base64 -d > TMessagesProj/config/release.keystore
+          sed -i -E "s/^RELEASE_KEY_PASSWORD=.*/RELEASE_KEY_PASSWORD=$KEYSTORE_PASSWORD/" gradle.properties
+          sed -i -E "s/^RELEASE_STORE_PASSWORD=.*/RELEASE_STORE_PASSWORD=$KEYSTORE_PASSWORD/" gradle.properties
+          sed -i -E "s/^RELEASE_KEY_ALIAS=.*/RELEASE_KEY_ALIAS=loudtg/" gradle.properties
+          keytool -list -keystore TMessagesProj/config/release.keystore -storepass "$KEYSTORE_PASSWORD" | grep -q PrivateKeyEntry
+          echo "Signing key OK"
+
+      - name: Voice patch
+        run: |
+          cat > /tmp/voice_patch.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """LoudTG voice patch: noise suppression + louder, clearer voice messages.
+
+          Run from the repo root (CI does this before building):
+              python3 .github/scripts/voice_patch.py
+
+          Tweak VOICE_GAIN below: 1.0 = original volume, 2.0 = about +6 dB, 2.8 = about +9 dB.
+          """
+          import pathlib
+          import sys
+
+          VOICE_GAIN = "2.0f"
+
+          ROOT = pathlib.Path(".")
+          MC = ROOT / "TMessagesProj/src/main/java/org/telegram/messenger/MediaController.java"
+          SC = ROOT / "TMessagesProj/src/main/java/org/telegram/messenger/SharedConfig.java"
+          AUDIO_C = ROOT / "TMessagesProj/jni/audio.c"
+
+
+          def patch(path, old, new, expected_count=1):
+              text = path.read_text(encoding="utf-8")
+              if new in text and old not in text:
+                  print(f"[skip] {path.name}: already patched")
+                  return
+              n = text.count(old)
+              if n != expected_count:
+                  sys.exit(f"[FAIL] {path.name}: expected {expected_count} match(es), found {n}:\n  {old[:90]}")
+              path.write_text(text.replace(old, new), encoding="utf-8")
+              print(f"[ok]   {path.name}: {n} replacement(s)")
+
+
+          if "loudtgBoost" in MC.read_text(encoding="utf-8"):
+              print("Source already has the LoudTG voice patch; nothing to do.")
+              sys.exit(0)
+
+          # 1) Record through the voice-call mic path and attach the phone's
+          #    hardware noise suppressor, echo canceller and auto gain.
+          old_rec = ("audioRecorder = new AudioRecord(MediaRecorder.AudioSource.DEFAULT, sampleRate, "
+                     "AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, recordBufferSize);")
+          new_rec = ("audioRecorder = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, sampleRate, "
+                     "AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, recordBufferSize); "
+                     "loudtgApplyEffects(audioRecorder.getAudioSessionId());")
+          patch(MC, old_rec, new_rec, expected_count=2)
+
+          # 2) Helper methods: audio effects + gain with a soft limiter (no harsh clipping).
+          anchor = "    private Runnable recordRunnable = new Runnable() {"
+          helpers = f"""    private static final float LOUDTG_GAIN = {VOICE_GAIN};
+              private android.media.audiofx.NoiseSuppressor loudtgNs;
+              private android.media.audiofx.AutomaticGainControl loudtgAgc;
+              private android.media.audiofx.AcousticEchoCanceler loudtgAec;
+
+              private void loudtgApplyEffects(int sessionId) {{
+                  try {{
+                      if (loudtgNs != null) {{ loudtgNs.release(); loudtgNs = null; }}
+                      if (loudtgAgc != null) {{ loudtgAgc.release(); loudtgAgc = null; }}
+                      if (loudtgAec != null) {{ loudtgAec.release(); loudtgAec = null; }}
+                      if (android.media.audiofx.NoiseSuppressor.isAvailable()) {{
+                          loudtgNs = android.media.audiofx.NoiseSuppressor.create(sessionId);
+                          if (loudtgNs != null) loudtgNs.setEnabled(true);
+                      }}
+                      if (android.media.audiofx.AutomaticGainControl.isAvailable()) {{
+                          loudtgAgc = android.media.audiofx.AutomaticGainControl.create(sessionId);
+                          if (loudtgAgc != null) loudtgAgc.setEnabled(true);
+                      }}
+                      if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) {{
+                          loudtgAec = android.media.audiofx.AcousticEchoCanceler.create(sessionId);
+                          if (loudtgAec != null) loudtgAec.setEnabled(true);
+                      }}
+                  }} catch (Throwable e) {{
+                      FileLog.e(e);
+                  }}
+              }}
+
+              private static void loudtgBoost(ByteBuffer buf, int lenBytes) {{
+                  if (LOUDTG_GAIN == 1.0f) return;
+                  final float knee = 0.70f;
+                  for (int i = 0; i + 1 < lenBytes; i += 2) {{
+                      float x = buf.getShort(i) / 32768f * LOUDTG_GAIN;
+                      float a = Math.abs(x);
+                      if (a > knee) {{
+                          float y = knee + (1f - knee) * (float) Math.tanh((a - knee) / (1f - knee));
+                          x = x < 0 ? -y : y;
+                      }}
+                      buf.putShort(i, (short) Math.max(-32768, Math.min(32767, Math.round(x * 32767f))));
+                  }}
+              }}
+
+          """
+          patch(MC, anchor, helpers + anchor)
+
+          # 3) Apply the boost to every recorded chunk before it is encoded.
+          patch(MC, "buffer.limit(len);", "buffer.limit(len);\n                    loudtgBoost(buffer, len);")
+
+          # 4) Opus encoder: best quality mode, tuned for speech.
+          patch(AUDIO_C,
+                "//result = opus_encoder_ctl(_encoder, OPUS_SET_COMPLEXITY(10));",
+                "opus_encoder_ctl(_encoder, OPUS_SET_COMPLEXITY(10));\n"
+                "    opus_encoder_ctl(_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));")
+
+          # 5) Group calls / voice chats: noise suppression ON by default.
+          patch(SC,
+                'noiseSupression = preferences.getBoolean("noiseSupression", false);',
+                'noiseSupression = preferences.getBoolean("noiseSupression", true);')
+
+          # 6) Calls and group calls: replace the call-mic processor with
+          #    noise remover (spectral) + clarity boost + smart gate + auto volume + limiter.
+          WAR = ROOT / "TMessagesProj/src/main/java/org/webrtc/voiceengine/WebRtcAudioRecord.java"
+          CALL_PROC = r'''  private static class LoudProcessor {
+              static final float MAX_GAIN = 20f;
+              static final float TARGET = 0.65f;
+              static final float NS_FLOOR = 0.12f;
+              static final float NS_OVER = 1.6f;
+              static final float GATE_FLOOR = 0.35f;
+              static final float PRESENCE = 0.4f;
+              static final int FFT = 512, HOP = 256, BINS = FFT / 2 + 1;
+              static int rate = 0;
+              static float hpA, presA, slowAtk, slowRel, gOpen, gClose, agcUp, agcDown;
+              static int holdLen, minWin;
+              static float hpX, hpY, pres, slow, gate, agc;
+              static int holdCnt, hopCnt, inPos, outRead;
+              static final float[] win = new float[FFT];
+              static final float[] inBuf = new float[FFT];
+              static final float[] olaBuf = new float[FFT];
+              static final float[] outFifo = new float[HOP];
+              static final float[] re = new float[FFT], im = new float[FFT];
+              static final float[] smP = new float[BINS], minCur = new float[BINS], minPrev = new float[BINS], noise = new float[BINS], prevClean = new float[BINS];
+              static float speechProb;
+
+              static float coef(float ms, int fs) {
+                return (float) (1.0 - Math.exp(-1000.0 / (ms * fs)));
+              }
+
+              static void init(int fs) {
+                rate = fs;
+                hpA = (float) Math.exp(-2.0 * Math.PI * 90.0 / fs);
+                presA = (float) (1.0 - Math.exp(-2.0 * Math.PI * 2500.0 / fs));
+                slowAtk = coef(15f, fs); slowRel = coef(400f, fs);
+                gOpen = coef(5f, fs); gClose = coef(200f, fs);
+                agcUp = coef(500f, fs); agcDown = coef(30f, fs);
+                holdLen = fs * 200 / 1000;
+                minWin = Math.max(20, fs / HOP);
+                for (int i = 0; i < FFT; i++) win[i] = (float) Math.sqrt(0.5 - 0.5 * Math.cos(2 * Math.PI * i / FFT));
+                java.util.Arrays.fill(inBuf, 0f); java.util.Arrays.fill(olaBuf, 0f); java.util.Arrays.fill(outFifo, 0f);
+                java.util.Arrays.fill(smP, 0f); java.util.Arrays.fill(prevClean, 0f);
+                java.util.Arrays.fill(minCur, 1e9f); java.util.Arrays.fill(minPrev, 1e9f); java.util.Arrays.fill(noise, 1e-7f);
+                hpX = hpY = pres = slow = 0f; gate = 1f; agc = 1f; holdCnt = 0; hopCnt = 0; inPos = 0; outRead = 0; speechProb = 0f;
+              }
+
+              static void fft(float[] r, float[] m, boolean inv) {
+                int n = r.length;
+                for (int i = 1, j = 0; i < n; i++) {
+                  int bit = n >> 1;
+                  for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+                  j ^= bit;
+                  if (i < j) { float t = r[i]; r[i] = r[j]; r[j] = t; t = m[i]; m[i] = m[j]; m[j] = t; }
+                }
+                for (int len = 2; len <= n; len <<= 1) {
+                  double ang = 2 * Math.PI / len * (inv ? 1 : -1);
+                  float wr = (float) Math.cos(ang), wi = (float) Math.sin(ang);
+                  for (int i = 0; i < n; i += len) {
+                    float cr = 1f, ci = 0f;
+                    for (int k = 0; k < len / 2; k++) {
+                      int a = i + k, b = a + len / 2;
+                      float xr = r[b] * cr - m[b] * ci, xi = r[b] * ci + m[b] * cr;
+                      r[b] = r[a] - xr; m[b] = m[a] - xi; r[a] += xr; m[a] += xi;
+                      float t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+                    }
+                  }
+                }
+              }
+
+              static void denoiseFrame() {
+                for (int i = 0; i < FFT; i++) { re[i] = inBuf[i] * win[i]; im[i] = 0f; }
+                fft(re, im, false);
+                int voiced = 0;
+                for (int k = 0; k < BINS; k++) {
+                  float p = re[k] * re[k] + im[k] * im[k];
+                  smP[k] = 0.75f * smP[k] + 0.25f * p;
+                  if (smP[k] < minCur[k]) minCur[k] = smP[k];
+                  float mn = Math.min(minCur[k], minPrev[k]);
+                  float target = mn * 1.8f;
+                  noise[k] += (target - noise[k]) * (target < noise[k] ? 0.3f : 0.05f);
+                  if (noise[k] < 1e-9f) noise[k] = 1e-9f;
+                  float post = p / (noise[k] * NS_OVER);
+                  float xi = 0.97f * prevClean[k] / (noise[k] * NS_OVER) + 0.03f * Math.max(post - 1f, 0f);
+                  float g = xi / (1f + xi);
+                  if (g < NS_FLOOR) g = NS_FLOOR;
+                  if (g > 0.5f) voiced++;
+                  prevClean[k] = g * g * p;
+                  re[k] *= g; im[k] *= g;
+                  if (k > 0 && k < FFT / 2) { re[FFT - k] = re[k]; im[FFT - k] = -im[k]; }
+                }
+                speechProb = (float) voiced / BINS;
+                if (++hopCnt >= minWin) {
+                  hopCnt = 0;
+                  System.arraycopy(minCur, 0, minPrev, 0, BINS);
+                  System.arraycopy(smP, 0, minCur, 0, BINS);
+                }
+                fft(re, im, true);
+                for (int i = 0; i < FFT; i++) olaBuf[i] += re[i] / FFT * win[i];
+                System.arraycopy(olaBuf, 0, outFifo, 0, HOP);
+                System.arraycopy(olaBuf, HOP, olaBuf, 0, FFT - HOP);
+                java.util.Arrays.fill(olaBuf, FFT - HOP, FFT, 0f);
+                System.arraycopy(inBuf, HOP, inBuf, 0, FFT - HOP);
+              }
+
+              static float nsSample(float x) {
+                inBuf[FFT - HOP + inPos] = x;
+                float y = outFifo[inPos];
+                if (++inPos >= HOP) { inPos = 0; denoiseFrame(); }
+                return y;
+              }
+
+              static void process(java.nio.ByteBuffer buf, int bytesRead, int fs) {
+                try {
+                  if (fs <= 0) fs = 48000;
+                  if (fs != rate) init(fs);
+                  int n = bytesRead / 2;
+                  for (int i = 0; i < n; i++) {
+                    float x = buf.getShort(i * 2) / 32768f;
+                    float y = hpA * (hpY + x - hpX);
+                    hpX = x;
+                    hpY = y;
+                    float c = nsSample(y);
+                    pres += presA * (c - pres);
+                    float v = c + PRESENCE * (c - pres);
+                    float a = Math.abs(v);
+                    slow += (a - slow) * (a > slow ? slowAtk : slowRel);
+                    if (speechProb > 0.06f) holdCnt = holdLen; else if (holdCnt > 0) holdCnt--;
+                    float gTarget = holdCnt > 0 ? 1f : GATE_FLOOR;
+                    gate += (gTarget - gate) * (gTarget > gate ? gOpen : gClose);
+                    if (holdCnt > 0) {
+                      float want = TARGET / Math.max(slow * 1.6f, 1e-4f);
+                      if (want > MAX_GAIN) want = MAX_GAIN;
+                      if (want < 1f) want = 1f;
+                      agc += (want - agc) * (want > agc ? agcUp : agcDown);
+                    }
+                    float o = v * agc * gate;
+                    float m = Math.abs(o);
+                    if (m > 0.7f) {
+                      float s = 0.7f + 0.3f * (float) Math.tanh((m - 0.7f) / 0.3f);
+                      o = o < 0 ? -s : s;
+                    }
+                    buf.putShort(i * 2, (short) Math.max(-32767, Math.min(32767, Math.round(o * 32767f))));
+                  }
+                } catch (Throwable t) {
+                  rate = 0;
+                }
+              }
+            }
+          '''
+          w = WAR.read_text(encoding="utf-8")
+          if "NS_FLOOR" in w:
+              print("[skip] WebRtcAudioRecord.java: already patched")
+          else:
+              if "class LoudProcessor" in w:
+                  start = w.index("  private static class LoudProcessor")
+                  end = w.rindex("}")
+                  w = w[:start] + CALL_PROC + w[end:]
+                  call_old = "LoudProcessor.process(byteBuffer, bytesRead);"
+                  if w.count(call_old) != 1:
+                      sys.exit("[FAIL] WebRtcAudioRecord.java: processor call not found")
+                  w = w.replace(call_old, "LoudProcessor.process(byteBuffer, bytesRead, requestedSampleRate);")
+              else:
+                  anchor = "          if (bytesRead == deviceBytesRead) {"
+                  if w.count(anchor) != 1:
+                      sys.exit("[FAIL] WebRtcAudioRecord.java: insert point not found")
+                  w = w.replace(anchor, "          if (!microphoneMute) {\n            LoudProcessor.process(byteBuffer, bytesRead, requestedSampleRate);\n          }\n" + anchor)
+                  end = w.rindex("}")
+                  w = w[:end] + CALL_PROC + w[end:]
+              WAR.write_text(w, encoding="utf-8")
+              print("[ok]   WebRtcAudioRecord.java: call voice processor installed")
+
+          print("Voice patch applied.")
+          PYEOF
+          python3 /tmp/voice_patch.py
 
       - name: Build
-        run: ./gradlew :TMessagesProj_App:assembleDebug --no-daemon --stacktrace
+        run: |
+          chmod +x gradlew
+          ./gradlew :TMessagesProj_App:assembleAfatRelease --no-daemon --stacktrace
+
+      - name: Prepare APK
+        run: |
+          set -e
+          APK=$(find TMessagesProj_App/build/outputs/apk -name "*.apk" | head -n 1)
+          echo "Built: $APK"
+          mkdir -p out
+          cp "$APK" "out/LoudTG-${{ github.run_number }}.apk"
+          ls -lh out
 
       - uses: actions/upload-artifact@v4
         with:
           name: loudtg-apk
-          path: TMessagesProj_App/build/outputs/apk/**/*.apk
+          path: out/*.apk
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: LoudTG build ${{ github.run_number }}
+          body: Install this APK. It updates over the previous LoudTG build without losing your chats.
+          files: out/*.apk
+          make_latest: true
